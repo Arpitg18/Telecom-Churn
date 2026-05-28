@@ -1,126 +1,182 @@
 import requests
 import streamlit as st
 
-BASE_URL = "https://api.opentripmap.com/0.1/en/places"
-REQUEST_TIMEOUT = 15
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+USER_AGENT = "TouristAttractionsApp/1.0 (https://github.com/arpitg18/telecom-churn)"
+REQUEST_TIMEOUT = 30
+OVERPASS_TIMEOUT = 60
 
-PRICE_TABLE = [
-    ("amusement_parks", "$60"),
-    ("theatres_and_entertainments", "$45"),
-    ("sport", "$25"),
-    ("foods", "$20"),
-    ("museums", "$15"),
-    ("historic", "$10"),
-    ("monuments_and_memorials", "$5"),
-    ("religion", "Free / donation"),
-    ("natural", "Free"),
-    ("urban_environment", "Free"),
-]
+PRICE_TABLE = {
+    "theme_park": "$60",
+    "water_park": "$45",
+    "amusement_arcade": "$30",
+    "aquarium": "$30",
+    "zoo": "$25",
+    "museum": "$15",
+    "gallery": "$12",
+    "castle": "$15",
+    "archaeological_site": "$10",
+    "attraction": "$10",
+    "ruins": "$8",
+    "monument": "$5",
+    "place_of_worship": "Free / donation",
+    "memorial": "Free",
+    "artwork": "Free",
+    "viewpoint": "Free",
+    "picnic_site": "Free",
+    "park": "Free",
+    "garden": "Free",
+    "nature_reserve": "Free",
+    "beach": "Free",
+}
 DEFAULT_PRICE = "$10"
 
+CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural")
 
-def get_api_key() -> str:
-    secret_key = ""
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_location(name: str):
     try:
-        secret_key = st.secrets.get("OPENTRIPMAP_API_KEY", "")
-    except Exception:
-        secret_key = ""
-
-    if secret_key:
-        return secret_key
-
-    st.sidebar.markdown("### OpenTripMap API key")
-    st.sidebar.caption("Get a free key at [opentripmap.io](https://opentripmap.io/product).")
-    return st.sidebar.text_input("API key", type="password", key="api_key_input").strip()
-
-
-def get_price_estimate(kinds: str) -> str:
-    if not kinds:
-        return DEFAULT_PRICE
-    tokens = {k.strip() for k in kinds.split(",")}
-    for token, price in PRICE_TABLE:
-        if token in tokens:
-            return price
-    return DEFAULT_PRICE
-
-
-def _handle_response(resp: requests.Response):
-    if resp.status_code == 429:
-        st.warning("Rate limit hit — wait a minute and retry.")
-        return None
-    if resp.status_code == 401 or resp.status_code == 403:
-        st.error("API key was rejected. Double-check your OpenTripMap key.")
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": name, "format": "json", "limit": 1, "addressdetails": 1},
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        st.error(f"Geocoding network error: {e}")
         return None
     if not resp.ok:
-        st.error(f"API error: HTTP {resp.status_code}")
+        st.error(f"Geocoding error: HTTP {resp.status_code}")
         return None
     try:
-        return resp.json()
+        data = resp.json()
     except ValueError:
-        st.error("API returned an unexpected response.")
         return None
+    if not data:
+        return None
+    item = data[0]
+    return {
+        "lat": float(item["lat"]),
+        "lon": float(item["lon"]),
+        "display_name": item.get("display_name", name),
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def geocode_location(name: str, api_key: str):
+def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
+    tourism_re = "museum|attraction|gallery|theme_park|water_park|zoo|aquarium|viewpoint|artwork|picnic_site"
+    historic_re = "monument|memorial|castle|ruins|archaeological_site"
+    leisure_re = "park|garden|nature_reserve"
+    amenity_re = "place_of_worship"
+    natural_re = "beach"
+
+    query = f"""
+    [out:json][timeout:{OVERPASS_TIMEOUT}];
+    (
+      node["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
+    );
+    out center body {limit * 4};
+    """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/geoname",
-            params={"name": name, "apikey": api_key},
-            timeout=REQUEST_TIMEOUT,
+        resp = requests.post(
+            OVERPASS_URL,
+            data={"data": query},
+            headers={"User-Agent": USER_AGENT},
+            timeout=OVERPASS_TIMEOUT + 10,
         )
     except requests.RequestException as e:
-        st.error(f"Network error while geocoding: {e}")
-        return None
-
-    data = _handle_response(resp)
-    if not isinstance(data, dict) or data.get("status") == "NOT_FOUND" or "lat" not in data:
-        return None
-    return data
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_attractions(lat, lon, radius_m, min_rate, limit, api_key):
+        st.error(f"Attractions API network error: {e}")
+        return []
+    if not resp.ok:
+        st.error(f"Attractions API error: HTTP {resp.status_code}")
+        return []
     try:
-        resp = requests.get(
-            f"{BASE_URL}/radius",
-            params={
-                "radius": radius_m,
-                "lon": lon,
-                "lat": lat,
-                "rate": min_rate,
-                "format": "json",
-                "limit": limit,
-                "apikey": api_key,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as e:
-        st.error(f"Network error while fetching attractions: {e}")
+        elements = resp.json().get("elements", [])
+    except ValueError:
         return []
 
-    data = _handle_response(resp)
-    if not isinstance(data, list):
-        return []
-    return data
+    seen_names = set()
+    deduped = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        deduped.append(el)
+
+    def rank_key(el):
+        tags = el.get("tags") or {}
+        has_wiki = bool(tags.get("wikipedia") or tags.get("wikidata"))
+        has_image = bool(tags.get("image") or tags.get("wikimedia_commons"))
+        return (0 if has_wiki else 1, 0 if has_image else 1, tags.get("name", ""))
+
+    deduped.sort(key=rank_key)
+    return deduped[:limit]
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_place_details(xid: str, api_key: str) -> dict:
+def fetch_wikipedia_summary(wikipedia_tag: str):
+    if not wikipedia_tag or ":" not in wikipedia_tag:
+        return None
+    lang, title = wikipedia_tag.split(":", 1)
+    lang = lang.strip() or "en"
+    title = title.strip().replace(" ", "_")
+    if not title:
+        return None
     try:
         resp = requests.get(
-            f"{BASE_URL}/xid/{xid}",
-            params={"apikey": api_key},
+            f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}",
+            headers={"User-Agent": USER_AGENT},
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException:
-        return {}
+        return None
     if not resp.ok:
-        return {}
+        return None
     try:
-        return resp.json() or {}
+        data = resp.json()
     except ValueError:
-        return {}
+        return None
+    return {
+        "extract": data.get("extract", ""),
+        "thumbnail": (data.get("thumbnail") or {}).get("source"),
+    }
+
+
+def get_price_estimate(tags: dict) -> str:
+    for key in CATEGORY_KEYS:
+        v = tags.get(key)
+        if v and v in PRICE_TABLE:
+            return PRICE_TABLE[v]
+    return DEFAULT_PRICE
+
+
+def category_label(tags: dict) -> str:
+    for key in CATEGORY_KEYS:
+        v = tags.get(key)
+        if v:
+            return v.replace("_", " ").title()
+    return "Attraction"
+
+
+def get_coords(element: dict):
+    if "lat" in element and "lon" in element:
+        return element["lat"], element["lon"]
+    center = element.get("center") or {}
+    if "lat" in center and "lon" in center:
+        return center["lat"], center["lon"]
+    return None, None
 
 
 def _truncate(text: str, max_len: int = 280) -> str:
@@ -130,36 +186,25 @@ def _truncate(text: str, max_len: int = 280) -> str:
     return text[: max_len - 1].rsplit(" ", 1)[0] + "…"
 
 
-def _format_kinds(kinds: str, max_tags: int = 4) -> str:
-    if not kinds:
-        return ""
-    tokens = [k.strip().replace("_", " ") for k in kinds.split(",") if k.strip()]
-    return " · ".join(tokens[:max_tags])
+def render_attraction_card(element: dict) -> None:
+    tags = element.get("tags") or {}
+    name = tags.get("name", "Unnamed attraction")
+    lat, lon = get_coords(element)
+    label = category_label(tags)
+    price = get_price_estimate(tags)
 
+    summary = None
+    if tags.get("wikipedia"):
+        summary = fetch_wikipedia_summary(tags["wikipedia"])
 
-def render_attraction_card(place: dict) -> None:
-    name = place.get("name") or "Unnamed attraction"
-    kinds = place.get("kinds", "")
-    preview = place.get("preview") or {}
-    image_url = preview.get("source") if isinstance(preview, dict) else None
-    description = ""
-    if isinstance(place.get("wikipedia_extracts"), dict):
-        description = place["wikipedia_extracts"].get("text", "")
-    if not description:
-        description = place.get("info", {}).get("descr", "") if isinstance(place.get("info"), dict) else ""
-
-    point = place.get("point") or {}
-    lat = point.get("lat")
-    lon = point.get("lon")
-
-    price = get_price_estimate(kinds)
+    image = (summary or {}).get("thumbnail") or tags.get("image")
+    description = (summary or {}).get("extract")
 
     with st.container(border=True):
-        if image_url:
-            st.image(image_url, use_container_width=True)
+        if image:
+            st.image(image, use_container_width=True)
         st.subheader(name)
-        if kinds:
-            st.caption(_format_kinds(kinds))
+        st.caption(label)
         if description:
             st.write(_truncate(description))
         st.markdown(f"**Estimated price:** {price}")
@@ -170,32 +215,26 @@ def render_attraction_card(place: dict) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Top Tourist Attractions", page_icon="🗺️", layout="wide")
-    st.title("🗺️ Top Tourist Attractions")
-    st.caption("Pick a city, state, or country and see top-rated activities with estimated prices.")
-
-    api_key = get_api_key()
+    st.set_page_config(page_title="Top Tourist Attractions", page_icon="\U0001f5fa️", layout="wide")
+    st.title("\U0001f5fa️ Top Tourist Attractions")
+    st.caption("Pick a city, state, or country and see top activities with estimated prices.")
 
     with st.sidebar:
         st.markdown("### Search")
         location = st.text_input("City / state / country", value="Paris")
         radius_km = st.number_input("Search radius (km)", min_value=1, max_value=50, value=10)
-        min_rate = st.slider("Minimum rating", min_value=1, max_value=3, value=2)
         limit = st.number_input("Max results", min_value=5, max_value=50, value=20)
         search = st.button("Search", type="primary", use_container_width=True)
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
         "Prices are static estimates by category — actual ticket prices vary. "
-        "Data: [OpenTripMap](https://opentripmap.io)."
+        "Data: [OpenStreetMap](https://openstreetmap.org) + [Wikipedia](https://wikipedia.org). "
+        "No API key required."
     )
 
     if not search:
-        st.info("Enter a location in the sidebar and click **Search** to begin.")
-        return
-
-    if not api_key:
-        st.warning("An OpenTripMap API key is required. Add it in the sidebar or in `.streamlit/secrets.toml`.")
+        st.info("Enter a location in the sidebar and tap **Search** to begin.")
         return
 
     if not location.strip():
@@ -203,53 +242,30 @@ def main() -> None:
         return
 
     with st.spinner(f"Looking up '{location}'…"):
-        geo = geocode_location(location.strip(), api_key)
+        geo = geocode_location(location.strip())
 
     if not geo:
         st.error("Location not found — try a different spelling or a more specific name.")
         return
 
-    place_name = geo.get("name", location)
-    country = geo.get("country", "")
-    lat, lon = geo["lat"], geo["lon"]
-    header = f"📍 {place_name}" + (f", {country}" if country else "")
-    st.subheader(header)
-    st.caption(f"Coordinates: {lat:.4f}, {lon:.4f}")
+    st.subheader(f"\U0001f4cd {geo['display_name']}")
+    st.caption(f"Coordinates: {geo['lat']:.4f}, {geo['lon']:.4f}")
 
-    with st.spinner("Fetching top attractions…"):
-        raw_places = fetch_attractions(lat, lon, int(radius_km) * 1000, int(min_rate), int(limit), api_key)
+    with st.spinner("Fetching top attractions… (first search can take 10–20s)"):
+        elements = fetch_attractions(geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit))
 
-    if not raw_places:
-        st.info("No attractions found — try widening the radius or lowering the rating threshold.")
+    if not elements:
+        st.info("No attractions found — try widening the radius or a different location.")
         return
 
-    raw_places.sort(key=lambda p: p.get("rate", 0), reverse=True)
-
-    details = []
-    progress = st.progress(0.0, text="Loading attraction details…")
-    for i, place in enumerate(raw_places, start=1):
-        xid = place.get("xid")
-        if not xid:
-            continue
-        detail = fetch_place_details(xid, api_key)
-        if not detail or not detail.get("name"):
-            continue
-        details.append(detail)
-        progress.progress(i / len(raw_places), text=f"Loading attraction details… ({i}/{len(raw_places)})")
-    progress.empty()
-
-    if not details:
-        st.info("Found locations but couldn't load details. Try again or widen the radius.")
-        return
-
-    st.markdown(f"### Top {len(details)} activities")
+    st.markdown(f"### Top {len(elements)} activities")
     cols_per_row = 3
-    for row_start in range(0, len(details), cols_per_row):
-        row = details[row_start : row_start + cols_per_row]
+    for row_start in range(0, len(elements), cols_per_row):
+        row = elements[row_start : row_start + cols_per_row]
         cols = st.columns(cols_per_row)
-        for col, place in zip(cols, row):
+        for col, element in zip(cols, row):
             with col:
-                render_attraction_card(place)
+                render_attraction_card(element)
 
 
 if __name__ == "__main__":
