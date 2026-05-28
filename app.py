@@ -1,8 +1,12 @@
 import requests
 import streamlit as st
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 USER_AGENT = "TouristAttractionsApp/1.0 (https://github.com/arpitg18/telecom-churn)"
 REQUEST_TIMEOUT = 30
 OVERPASS_TIMEOUT = 60
@@ -39,8 +43,8 @@ CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural")
 def geocode_location(name: str):
     try:
         resp = requests.get(
-            NOMINATIM_URL,
-            params={"q": name, "format": "json", "limit": 1, "addressdetails": 1},
+            GEOCODE_URL,
+            params={"name": name, "count": 1, "language": "en", "format": "json"},
             headers={"User-Agent": USER_AGENT},
             timeout=REQUEST_TIMEOUT,
         )
@@ -54,13 +58,16 @@ def geocode_location(name: str):
         data = resp.json()
     except ValueError:
         return None
-    if not data:
+    results = (data or {}).get("results") or []
+    if not results:
         return None
-    item = data[0]
+    item = results[0]
+    parts = [item.get("name"), item.get("admin1"), item.get("country")]
+    display_name = ", ".join(p for p in parts if p)
     return {
-        "lat": float(item["lat"]),
-        "lon": float(item["lon"]),
-        "display_name": item.get("display_name", name),
+        "lat": float(item["latitude"]),
+        "lon": float(item["longitude"]),
+        "display_name": display_name or name,
     }
 
 
@@ -87,18 +94,29 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     );
     out center body {limit * 4};
     """
-    try:
-        resp = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            headers={"User-Agent": USER_AGENT},
-            timeout=OVERPASS_TIMEOUT + 10,
-        )
-    except requests.RequestException as e:
-        st.error(f"Attractions API network error: {e}")
-        return []
-    if not resp.ok:
-        st.error(f"Attractions API error: HTTP {resp.status_code}")
+    resp = None
+    last_status = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            resp = requests.post(
+                endpoint,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=OVERPASS_TIMEOUT + 10,
+            )
+        except requests.RequestException:
+            resp = None
+            continue
+        if resp.ok:
+            break
+        last_status = resp.status_code
+        resp = None
+
+    if resp is None:
+        if last_status:
+            st.error(f"Attractions API error: HTTP {last_status} (all mirrors busy — try again in a moment)")
+        else:
+            st.error("Attractions API unreachable — try again in a moment.")
         return []
     try:
         elements = resp.json().get("elements", [])
