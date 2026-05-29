@@ -113,19 +113,23 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     (
       node["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
+      relation["tourism"~"^({tourism_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       node["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
+      relation["historic"~"^({historic_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       node["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["natural"~"^({natural_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      relation["natural"~"^({natural_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       node["aerialway"~"^({aerialway_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       way["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      relation["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
     );
-    out center body {limit * 6};
+    out center body {limit * 8};
     """
     resp = None
     last_status = None
