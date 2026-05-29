@@ -43,6 +43,7 @@ PRICE_TABLE = {
     "cave_entrance": "$8",
     "cliff": "Free",
     "ridge": "Free",
+    "mountain_range": "Free",
     "glacier": "Free",
     "saddle": "Free",
     "bay": "Free",
@@ -51,6 +52,7 @@ PRICE_TABLE = {
     "locality": "Free",
     "island": "Free",
     "peninsula": "Free",
+    "village": "Free",
 }
 DEFAULT_PRICE = "$10"
 
@@ -102,9 +104,9 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     historic_re = "monument|memorial|castle|ruins|archaeological_site"
     leisure_re = "park|garden|nature_reserve"
     amenity_re = "place_of_worship"
-    natural_re = "beach|peak|volcano|cave_entrance|cliff|ridge|glacier|saddle|bay|hot_spring"
+    natural_re = "beach|peak|volcano|cave_entrance|cliff|ridge|glacier|saddle|bay|hot_spring|mountain_range"
     aerialway_re = "station"
-    place_re = "region|locality|island|peninsula"
+    place_re = "region|locality|island|peninsula|village"
 
     query = f"""
     [out:json][timeout:{OVERPASS_TIMEOUT}];
@@ -118,14 +120,12 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
       node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
-      way["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["natural"~"^({natural_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       node["aerialway"~"^({aerialway_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
       way["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
-      node["wikipedia"]["name"](around:{radius_m},{lat},{lon});
-      way["wikipedia"]["name"](around:{radius_m},{lat},{lon});
     );
-    out center body {limit * 10};
+    out center body {limit * 6};
     """
     resp = None
     last_status = None
@@ -146,15 +146,15 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
         resp = None
 
     if resp is None:
-        if last_status:
-            st.error(f"Attractions API error: HTTP {last_status} (all mirrors busy — try again in a moment)")
-        else:
-            st.error("Attractions API unreachable — try again in a moment.")
-        return []
+        detail = f"HTTP {last_status}" if last_status else "no response"
+        raise RuntimeError(
+            f"All Overpass mirrors failed ({detail}). The OpenStreetMap "
+            "servers are likely overloaded — try again in a moment."
+        )
     try:
         elements = resp.json().get("elements", [])
     except ValueError:
-        return []
+        raise RuntimeError("Overpass returned an invalid response — try again in a moment.")
 
     seen_names = set()
     deduped = []
@@ -363,8 +363,12 @@ def main() -> None:
     st.subheader(f"\U0001f4cd {geo['display_name']}")
     st.caption(f"Coordinates: {geo['lat']:.4f}, {geo['lon']:.4f}")
 
-    with st.spinner("Fetching attractions from OpenStreetMap…"):
-        elements = fetch_attractions(geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit))
+    try:
+        with st.spinner("Fetching attractions from OpenStreetMap…"):
+            elements = fetch_attractions(geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit))
+    except RuntimeError as e:
+        st.error(str(e))
+        return
 
     if not elements:
         st.info("No attractions found — try widening the radius or a different location.")
