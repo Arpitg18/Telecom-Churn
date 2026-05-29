@@ -1,3 +1,6 @@
+import re
+from datetime import date, timedelta
+
 import requests
 import streamlit as st
 
@@ -17,6 +20,7 @@ PRICE_TABLE = {
     "amusement_arcade": "$30",
     "aquarium": "$30",
     "zoo": "$25",
+    "aerialway_station": "$40",
     "museum": "$15",
     "gallery": "$12",
     "castle": "$15",
@@ -24,6 +28,7 @@ PRICE_TABLE = {
     "attraction": "$10",
     "ruins": "$8",
     "monument": "$5",
+    "alpine_hut": "$0",
     "place_of_worship": "Free / donation",
     "memorial": "Free",
     "artwork": "Free",
@@ -33,10 +38,21 @@ PRICE_TABLE = {
     "garden": "Free",
     "nature_reserve": "Free",
     "beach": "Free",
+    "peak": "Free",
+    "volcano": "Free",
+    "cave_entrance": "$8",
+    "cliff": "Free",
 }
 DEFAULT_PRICE = "$10"
 
-CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural")
+CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural", "aerialway")
+
+SORT_OPTIONS = [
+    "Most famous",
+    "Cheapest first",
+    "Most expensive first",
+    "Alphabetical",
+]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -73,11 +89,12 @@ def geocode_location(name: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
-    tourism_re = "museum|attraction|gallery|theme_park|water_park|zoo|aquarium|viewpoint|artwork|picnic_site"
+    tourism_re = "museum|attraction|gallery|theme_park|water_park|zoo|aquarium|viewpoint|artwork|picnic_site|alpine_hut"
     historic_re = "monument|memorial|castle|ruins|archaeological_site"
     leisure_re = "park|garden|nature_reserve"
     amenity_re = "place_of_worship"
-    natural_re = "beach"
+    natural_re = "beach|peak|volcano|cave_entrance|cliff"
+    aerialway_re = "station"
 
     query = f"""
     [out:json][timeout:{OVERPASS_TIMEOUT}];
@@ -91,8 +108,9 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
       node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["aerialway"~"^({aerialway_re})$"]["name"](around:{radius_m},{lat},{lon});
     );
-    out center body {limit * 4};
+    out center body {limit * 6};
     """
     resp = None
     last_status = None
@@ -132,15 +150,7 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
             continue
         seen_names.add(name)
         deduped.append(el)
-
-    def rank_key(el):
-        tags = el.get("tags") or {}
-        has_wiki = bool(tags.get("wikipedia") or tags.get("wikidata"))
-        has_image = bool(tags.get("image") or tags.get("wikimedia_commons"))
-        return (0 if has_wiki else 1, 0 if has_image else 1, tags.get("name", ""))
-
-    deduped.sort(key=rank_key)
-    return deduped[:limit]
+    return deduped
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -172,7 +182,39 @@ def fetch_wikipedia_summary(wikipedia_tag: str):
     }
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_pageviews(wikipedia_tag: str) -> int:
+    if not wikipedia_tag or ":" not in wikipedia_tag:
+        return 0
+    lang, title = wikipedia_tag.split(":", 1)
+    lang = lang.strip() or "en"
+    title = title.strip().replace(" ", "_")
+    if not title:
+        return 0
+    end = date.today() - timedelta(days=2)
+    start = end - timedelta(days=30)
+    url = (
+        f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
+        f"{lang}.wikipedia/all-access/user/{title}/daily/"
+        f"{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
+    )
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return 0
+    if not resp.ok:
+        return 0
+    try:
+        items = resp.json().get("items", [])
+    except ValueError:
+        return 0
+    return sum(item.get("views", 0) for item in items)
+
+
 def get_price_estimate(tags: dict) -> str:
+    aerialway = tags.get("aerialway")
+    if aerialway == "station":
+        return PRICE_TABLE["aerialway_station"]
     for key in CATEGORY_KEYS:
         v = tags.get(key)
         if v and v in PRICE_TABLE:
@@ -180,7 +222,18 @@ def get_price_estimate(tags: dict) -> str:
     return DEFAULT_PRICE
 
 
+def price_numeric(price_str: str) -> int:
+    if not price_str:
+        return 0
+    if "free" in price_str.lower():
+        return 0
+    m = re.search(r"\d+", price_str)
+    return int(m.group()) if m else 0
+
+
 def category_label(tags: dict) -> str:
+    if tags.get("aerialway") == "station":
+        return "Cable Car Station"
     for key in CATEGORY_KEYS:
         v = tags.get(key)
         if v:
@@ -204,19 +257,41 @@ def _truncate(text: str, max_len: int = 280) -> str:
     return text[: max_len - 1].rsplit(" ", 1)[0] + "…"
 
 
-def render_attraction_card(element: dict) -> None:
+def enrich(element: dict) -> dict:
     tags = element.get("tags") or {}
-    name = tags.get("name", "Unnamed attraction")
-    lat, lon = get_coords(element)
+    wiki_tag = tags.get("wikipedia")
+    summary = fetch_wikipedia_summary(wiki_tag) if wiki_tag else None
+    pageviews = fetch_pageviews(wiki_tag) if wiki_tag else 0
+    return {
+        "element": element,
+        "tags": tags,
+        "name": tags.get("name", "Unnamed attraction"),
+        "summary": summary,
+        "pageviews": pageviews,
+        "price_str": get_price_estimate(tags),
+    }
+
+
+def sort_enriched(items: list, sort_by: str) -> list:
+    if sort_by == "Most famous":
+        return sorted(items, key=lambda i: (-i["pageviews"], i["name"].lower()))
+    if sort_by == "Cheapest first":
+        return sorted(items, key=lambda i: (price_numeric(i["price_str"]), i["name"].lower()))
+    if sort_by == "Most expensive first":
+        return sorted(items, key=lambda i: (-price_numeric(i["price_str"]), i["name"].lower()))
+    return sorted(items, key=lambda i: i["name"].lower())
+
+
+def render_attraction_card(item: dict) -> None:
+    tags = item["tags"]
+    name = item["name"]
+    lat, lon = get_coords(item["element"])
     label = category_label(tags)
-    price = get_price_estimate(tags)
-
-    summary = None
-    if tags.get("wikipedia"):
-        summary = fetch_wikipedia_summary(tags["wikipedia"])
-
-    image = (summary or {}).get("thumbnail") or tags.get("image")
-    description = (summary or {}).get("extract")
+    price = item["price_str"]
+    summary = item["summary"] or {}
+    image = summary.get("thumbnail") or tags.get("image")
+    description = summary.get("extract")
+    pageviews = item["pageviews"]
 
     with st.container(border=True):
         if image:
@@ -226,6 +301,8 @@ def render_attraction_card(element: dict) -> None:
         if description:
             st.write(_truncate(description))
         st.markdown(f"**Estimated price:** {price}")
+        if pageviews:
+            st.caption(f"~{pageviews:,} Wikipedia views (last 30 days)")
         if lat is not None and lon is not None:
             st.markdown(
                 f"[View on map](https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon})"
@@ -239,14 +316,16 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("### Search")
-        location = st.text_input("City / state / country", value="Paris")
-        radius_km = st.number_input("Search radius (km)", min_value=1, max_value=50, value=10)
+        location = st.text_input("City / state / country", value="Lucerne")
+        radius_km = st.number_input("Search radius (km)", min_value=1, max_value=100, value=30)
         limit = st.number_input("Max results", min_value=5, max_value=50, value=20)
+        sort_by = st.selectbox("Sort by", SORT_OPTIONS, index=0)
         search = st.button("Search", type="primary", use_container_width=True)
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
         "Prices are static estimates by category — actual ticket prices vary. "
+        "“Most famous” ranks by Wikipedia pageviews (last 30 days). "
         "Data: [OpenStreetMap](https://openstreetmap.org) + [Wikipedia](https://wikipedia.org). "
         "No API key required."
     )
@@ -269,21 +348,26 @@ def main() -> None:
     st.subheader(f"\U0001f4cd {geo['display_name']}")
     st.caption(f"Coordinates: {geo['lat']:.4f}, {geo['lon']:.4f}")
 
-    with st.spinner("Fetching top attractions… (first search can take 10–20s)"):
+    with st.spinner("Fetching attractions from OpenStreetMap…"):
         elements = fetch_attractions(geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit))
 
     if not elements:
         st.info("No attractions found — try widening the radius or a different location.")
         return
 
-    st.markdown(f"### Top {len(elements)} activities")
+    with st.spinner(f"Ranking {len(elements)} attractions by Wikipedia popularity… (cached after first run)"):
+        enriched = [enrich(el) for el in elements]
+
+    enriched = sort_enriched(enriched, sort_by)[: int(limit)]
+
+    st.markdown(f"### Top {len(enriched)} activities — sorted by *{sort_by.lower()}*")
     cols_per_row = 3
-    for row_start in range(0, len(elements), cols_per_row):
-        row = elements[row_start : row_start + cols_per_row]
+    for row_start in range(0, len(enriched), cols_per_row):
+        row = enriched[row_start : row_start + cols_per_row]
         cols = st.columns(cols_per_row)
-        for col, element in zip(cols, row):
+        for col, item in zip(cols, row):
             with col:
-                render_attraction_card(element)
+                render_attraction_card(item)
 
 
 if __name__ == "__main__":
