@@ -42,10 +42,19 @@ PRICE_TABLE = {
     "volcano": "Free",
     "cave_entrance": "$8",
     "cliff": "Free",
+    "ridge": "Free",
+    "glacier": "Free",
+    "saddle": "Free",
+    "bay": "Free",
+    "hot_spring": "$10",
+    "region": "Free",
+    "locality": "Free",
+    "island": "Free",
+    "peninsula": "Free",
 }
 DEFAULT_PRICE = "$10"
 
-CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural", "aerialway")
+CATEGORY_KEYS = ("tourism", "historic", "leisure", "amenity", "natural", "aerialway", "place")
 
 SORT_OPTIONS = [
     "Most famous",
@@ -93,8 +102,9 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     historic_re = "monument|memorial|castle|ruins|archaeological_site"
     leisure_re = "park|garden|nature_reserve"
     amenity_re = "place_of_worship"
-    natural_re = "beach|peak|volcano|cave_entrance|cliff"
+    natural_re = "beach|peak|volcano|cave_entrance|cliff|ridge|glacier|saddle|bay|hot_spring"
     aerialway_re = "station"
+    place_re = "region|locality|island|peninsula"
 
     query = f"""
     [out:json][timeout:{OVERPASS_TIMEOUT}];
@@ -108,9 +118,14 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
       node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
+      way["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["aerialway"~"^({aerialway_re})$"]["name"](around:{radius_m},{lat},{lon});
+      node["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      way["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      node["wikipedia"]["name"](around:{radius_m},{lat},{lon});
+      way["wikipedia"]["name"](around:{radius_m},{lat},{lon});
     );
-    out center body {limit * 6};
+    out center body {limit * 10};
     """
     resp = None
     last_status = None
