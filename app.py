@@ -67,6 +67,8 @@ SORT_OPTIONS = [
 ]
 
 WIKIVOYAGE_LISTING_TEMPLATES = ("see", "do", "view", "listing", "marker")
+WIKIVOYAGE_MAX_SUBPAGES = 30
+WIKIVOYAGE_MAX_LISTINGS = 120
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -167,16 +169,22 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     except ValueError:
         raise RuntimeError("Overpass returned an invalid response — try again in a moment.")
 
-    seen_names = set()
-    deduped = []
+    by_name = {}
     for el in elements:
         tags = el.get("tags") or {}
-        name = tags.get("name")
-        if not name or name in seen_names:
+        name = tags.get("name:en") or tags.get("name")
+        if not name:
             continue
-        seen_names.add(name)
-        deduped.append(el)
-    return deduped
+        existing = by_name.get(name)
+        if existing is None:
+            by_name[name] = el
+            continue
+        ex_tags = existing.get("tags") or {}
+        has_wiki_new = bool(tags.get("wikipedia") or tags.get("wikidata"))
+        has_wiki_old = bool(ex_tags.get("wikipedia") or ex_tags.get("wikidata"))
+        if has_wiki_new and not has_wiki_old:
+            by_name[name] = el
+    return list(by_name.values())
 
 
 def _find_templates(wikitext: str, template_names: tuple) -> list:
@@ -335,21 +343,81 @@ def _wikivoyage_search_page(query: str):
     return results[0].get("title")
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_wikivoyage_listings(location: str) -> list:
-    title, wikitext = _wikivoyage_fetch_wikitext(location)
-    if not wikitext:
-        found = _wikivoyage_search_page(location)
-        if not found:
-            return []
-        title, wikitext = _wikivoyage_fetch_wikitext(found)
-        if not wikitext:
-            return []
+def _wikivoyage_list_subpages(title: str) -> list:
+    try:
+        resp = requests.get(
+            WIKIVOYAGE_API,
+            params={
+                "action": "query",
+                "list": "allpages",
+                "apprefix": f"{title}/",
+                "apnamespace": 0,
+                "aplimit": 50,
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return []
+    if not resp.ok:
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    return [p["title"] for p in data.get("query", {}).get("allpages", []) if "title" in p]
 
-    templates = _find_templates(wikitext, WIKIVOYAGE_LISTING_TEMPLATES)
+
+def _wikivoyage_fetch_multi_wikitext(titles: list) -> dict:
+    if not titles:
+        return {}
+    out = {}
+    for chunk_start in range(0, len(titles), 50):
+        chunk = titles[chunk_start : chunk_start + 50]
+        try:
+            resp = requests.get(
+                WIKIVOYAGE_API,
+                params={
+                    "action": "query",
+                    "prop": "revisions",
+                    "rvprop": "content",
+                    "rvslots": "main",
+                    "titles": "|".join(chunk),
+                    "format": "json",
+                    "redirects": 1,
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException:
+            continue
+        if not resp.ok:
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            continue
+        for _, page in data.get("query", {}).get("pages", {}).items():
+            if page.get("missing") is not None:
+                continue
+            revisions = page.get("revisions", [])
+            if not revisions:
+                continue
+            rev = revisions[0]
+            content = (
+                (rev.get("slots", {}) or {}).get("main", {}).get("*")
+                or rev.get("*")
+                or ""
+            )
+            if content:
+                out[page.get("title", "")] = content
+    return out
+
+
+def _parse_listings_from_wikitext(wikitext: str, seen_names: set, source_page: str = "") -> list:
     listings = []
-    seen_names = set()
-    for tmpl_name, body in templates:
+    for tmpl_name, body in _find_templates(wikitext, WIKIVOYAGE_LISTING_TEMPLATES):
         fields = _parse_template_fields(body)
         ltype = (fields.get("type") or tmpl_name).lower()
         if ltype not in ("see", "do", "view"):
@@ -368,7 +436,37 @@ def fetch_wikivoyage_listings(location: str) -> list:
             "image": fields.get("image", "").strip(),
             "wikidata": fields.get("wikidata", "").strip(),
             "type": ltype,
+            "source_page": source_page,
         })
+    return listings
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_wikivoyage_listings(location: str) -> list:
+    title, wikitext = _wikivoyage_fetch_wikitext(location)
+    if not wikitext:
+        found = _wikivoyage_search_page(location)
+        if not found:
+            return []
+        title, wikitext = _wikivoyage_fetch_wikitext(found)
+        if not wikitext:
+            return []
+
+    seen_names = set()
+    listings = _parse_listings_from_wikitext(wikitext, seen_names, source_page=title or location)
+
+    if title:
+        subpages = _wikivoyage_list_subpages(title)[:WIKIVOYAGE_MAX_SUBPAGES]
+        if subpages:
+            sub_wikitexts = _wikivoyage_fetch_multi_wikitext(subpages)
+            for sub_title, sub_wikitext in sub_wikitexts.items():
+                listings.extend(
+                    _parse_listings_from_wikitext(sub_wikitext, seen_names, source_page=sub_title)
+                )
+
+    if len(listings) > WIKIVOYAGE_MAX_LISTINGS:
+        listings.sort(key=lambda l: (0 if l.get("wikidata") else 1,))
+        listings = listings[:WIKIVOYAGE_MAX_LISTINGS]
     return listings
 
 
@@ -518,10 +616,11 @@ def enrich_osm(element: dict) -> dict:
         wiki_tag = wikidata_to_wikipedia(tags["wikidata"])
     summary = fetch_wikipedia_summary(wiki_tag) if wiki_tag else None
     pageviews = fetch_pageviews(wiki_tag) if wiki_tag else 0
+    name = tags.get("name:en") or tags.get("name") or "Unnamed attraction"
     return {
         "element": element,
         "tags": tags,
-        "name": tags.get("name", "Unnamed attraction"),
+        "name": name,
         "summary": summary,
         "pageviews": pageviews,
         "price_str": get_price_estimate(tags),
@@ -707,6 +806,11 @@ def main() -> None:
         st.write(f"Resolved location: **{geo['display_name']}** at `{geo['lat']:.5f}, {geo['lon']:.5f}`")
         if filter_text:
             st.write(f"Matching filter `{name_filter}`: **{len(filtered)}**")
+        if wv_listings:
+            pages_seen = sorted({l.get("source_page", "") for l in wv_listings if l.get("source_page")})
+            if pages_seen:
+                st.write(f"Wikivoyage pages parsed ({len(pages_seen)}):")
+                st.write(", ".join(pages_seen))
         if wv_items:
             st.write("Wikivoyage curated names:")
             st.write(", ".join(sorted(i["name"] for i in wv_items)))
