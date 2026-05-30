@@ -10,6 +10,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
+WIKIVOYAGE_API = "https://en.wikivoyage.org/w/api.php"
 USER_AGENT = "TouristAttractionsApp/1.0 (https://github.com/arpitg18/telecom-churn)"
 REQUEST_TIMEOUT = 30
 OVERPASS_TIMEOUT = 60
@@ -64,6 +65,8 @@ SORT_OPTIONS = [
     "Most expensive first",
     "Alphabetical",
 ]
+
+WIKIVOYAGE_LISTING_TEMPLATES = ("see", "do", "view", "listing", "marker")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -174,6 +177,199 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
         seen_names.add(name)
         deduped.append(el)
     return deduped
+
+
+def _find_templates(wikitext: str, template_names: tuple) -> list:
+    results = []
+    i = 0
+    n = len(wikitext)
+    while i < n - 1:
+        if wikitext[i : i + 2] != "{{":
+            i += 1
+            continue
+        j = i + 2
+        while j < n and wikitext[j] in " \t\n":
+            j += 1
+        name_start = j
+        while j < n and wikitext[j] not in "|}{ \t\n":
+            j += 1
+        tmpl_name = wikitext[name_start:j].lower().strip()
+        if tmpl_name not in template_names:
+            i += 1
+            continue
+        depth = 1
+        k = j
+        while k < n and depth > 0:
+            if wikitext[k : k + 2] == "{{":
+                depth += 1
+                k += 2
+            elif wikitext[k : k + 2] == "}}":
+                depth -= 1
+                k += 2
+            else:
+                k += 1
+        if depth != 0:
+            break
+        body = wikitext[j : k - 2]
+        results.append((tmpl_name, body))
+        i = k
+    return results
+
+
+def _parse_template_fields(body: str) -> dict:
+    parts = []
+    current = []
+    depth_square = 0
+    depth_curly = 0
+    i = 0
+    while i < len(body):
+        if body[i : i + 2] == "[[":
+            depth_square += 1
+            current.append(body[i : i + 2])
+            i += 2
+        elif body[i : i + 2] == "]]":
+            depth_square -= 1
+            current.append(body[i : i + 2])
+            i += 2
+        elif body[i : i + 2] == "{{":
+            depth_curly += 1
+            current.append(body[i : i + 2])
+            i += 2
+        elif body[i : i + 2] == "}}":
+            depth_curly -= 1
+            current.append(body[i : i + 2])
+            i += 2
+        elif body[i] == "|" and depth_square == 0 and depth_curly == 0:
+            parts.append("".join(current))
+            current = []
+            i += 1
+        else:
+            current.append(body[i])
+            i += 1
+    parts.append("".join(current))
+
+    fields = {}
+    for part in parts:
+        if "=" in part:
+            key, _, val = part.partition("=")
+            fields[key.strip().lower()] = val.strip()
+    return fields
+
+
+def _strip_wikitext(text: str) -> str:
+    text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
+    text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"'''([^']+)'''", r"\1", text)
+    text = re.sub(r"''([^']+)''", r"\1", text)
+    text = re.sub(r"\{\{[^{}]*\}\}", "", text)
+    return text.strip()
+
+
+def _parse_float(s):
+    if not s:
+        return None
+    s = s.strip().replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _wikivoyage_fetch_wikitext(page: str):
+    try:
+        resp = requests.get(
+            WIKIVOYAGE_API,
+            params={
+                "action": "parse",
+                "page": page,
+                "prop": "wikitext",
+                "format": "json",
+                "redirects": 1,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return None, None
+    if not resp.ok:
+        return None, None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, None
+    parse = data.get("parse")
+    if not parse:
+        return None, None
+    title = parse.get("title")
+    wikitext = (parse.get("wikitext") or {}).get("*")
+    return title, wikitext
+
+
+def _wikivoyage_search_page(query: str):
+    try:
+        resp = requests.get(
+            WIKIVOYAGE_API,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": 1,
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    results = data.get("query", {}).get("search", [])
+    if not results:
+        return None
+    return results[0].get("title")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_wikivoyage_listings(location: str) -> list:
+    title, wikitext = _wikivoyage_fetch_wikitext(location)
+    if not wikitext:
+        found = _wikivoyage_search_page(location)
+        if not found:
+            return []
+        title, wikitext = _wikivoyage_fetch_wikitext(found)
+        if not wikitext:
+            return []
+
+    templates = _find_templates(wikitext, WIKIVOYAGE_LISTING_TEMPLATES)
+    listings = []
+    seen_names = set()
+    for tmpl_name, body in templates:
+        fields = _parse_template_fields(body)
+        ltype = (fields.get("type") or tmpl_name).lower()
+        if ltype not in ("see", "do", "view"):
+            continue
+        name = _strip_wikitext(fields.get("name", ""))
+        if not name or name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        listings.append({
+            "name": name,
+            "lat": _parse_float(fields.get("lat")),
+            "lon": _parse_float(fields.get("long") or fields.get("lon")),
+            "url": fields.get("url", "").strip(),
+            "price": _strip_wikitext(fields.get("price", "")),
+            "content": _strip_wikitext(fields.get("content", "")),
+            "image": fields.get("image", "").strip(),
+            "wikidata": fields.get("wikidata", "").strip(),
+            "type": ltype,
+        })
+    return listings
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -315,7 +511,7 @@ def _truncate(text: str, max_len: int = 280) -> str:
     return text[: max_len - 1].rsplit(" ", 1)[0] + "…"
 
 
-def enrich(element: dict) -> dict:
+def enrich_osm(element: dict) -> dict:
     tags = element.get("tags") or {}
     wiki_tag = tags.get("wikipedia")
     if not wiki_tag and tags.get("wikidata"):
@@ -329,12 +525,63 @@ def enrich(element: dict) -> dict:
         "summary": summary,
         "pageviews": pageviews,
         "price_str": get_price_estimate(tags),
+        "source": "OpenStreetMap",
+        "category": category_label(tags),
+    }
+
+
+def enrich_wikivoyage(listing: dict) -> dict:
+    name = listing["name"]
+    wiki_tag = None
+    if listing.get("wikidata"):
+        wiki_tag = wikidata_to_wikipedia(listing["wikidata"])
+    if not wiki_tag:
+        wiki_tag = f"en:{name}"
+    summary = fetch_wikipedia_summary(wiki_tag)
+    if not summary or not summary.get("extract"):
+        summary = {"extract": listing.get("content", ""), "thumbnail": None}
+    elif listing.get("content") and not summary.get("extract"):
+        summary["extract"] = listing["content"]
+
+    pageviews = fetch_pageviews(wiki_tag) if wiki_tag else 0
+    if pageviews == 0 and listing.get("wikidata"):
+        resolved = wikidata_to_wikipedia(listing["wikidata"])
+        if resolved:
+            pageviews = fetch_pageviews(resolved)
+
+    price = listing.get("price") or ""
+    if not price:
+        price = DEFAULT_PRICE
+
+    coords_present = listing.get("lat") is not None and listing.get("lon") is not None
+    element = {"tags": {"name": name}}
+    if coords_present:
+        element["lat"] = listing["lat"]
+        element["lon"] = listing["lon"]
+
+    return {
+        "element": element,
+        "tags": {"name": name},
+        "name": name,
+        "summary": summary,
+        "pageviews": pageviews,
+        "price_str": price,
+        "source": "Wikivoyage",
+        "category": listing.get("type", "see").capitalize(),
+        "url": listing.get("url", ""),
     }
 
 
 def sort_enriched(items: list, sort_by: str) -> list:
     if sort_by == "Most famous":
-        return sorted(items, key=lambda i: (-i["pageviews"], i["name"].lower()))
+        return sorted(
+            items,
+            key=lambda i: (
+                0 if i.get("source") == "Wikivoyage" else 1,
+                -i["pageviews"],
+                i["name"].lower(),
+            ),
+        )
     if sort_by == "Cheapest first":
         return sorted(items, key=lambda i: (price_numeric(i["price_str"]), i["name"].lower()))
     if sort_by == "Most expensive first":
@@ -343,30 +590,36 @@ def sort_enriched(items: list, sort_by: str) -> list:
 
 
 def render_attraction_card(item: dict) -> None:
-    tags = item["tags"]
     name = item["name"]
     lat, lon = get_coords(item["element"])
-    label = category_label(tags)
+    label = item.get("category", "Attraction")
     price = item["price_str"]
     summary = item["summary"] or {}
-    image = summary.get("thumbnail") or tags.get("image")
+    image = summary.get("thumbnail")
     description = summary.get("extract")
     pageviews = item["pageviews"]
+    source = item.get("source", "")
+    url = item.get("url", "")
 
     with st.container(border=True):
         if image:
             st.image(image, use_container_width=True)
         st.subheader(name)
-        st.caption(label)
+        st.caption(f"{label} · {source}" if source else label)
         if description:
             st.write(_truncate(description))
         st.markdown(f"**Estimated price:** {price}")
         if pageviews:
             st.caption(f"~{pageviews:,} Wikipedia views (last 30 days)")
+        links = []
+        if url:
+            links.append(f"[Official site]({url})")
         if lat is not None and lon is not None:
-            st.markdown(
+            links.append(
                 f"[View on map](https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon})"
             )
+        if links:
+            st.markdown(" · ".join(links))
 
 
 def main() -> None:
@@ -380,7 +633,7 @@ def main() -> None:
         radius_km = st.number_input("Search radius (km)", min_value=1, max_value=100, value=30)
         limit = st.number_input("Max results", min_value=5, max_value=100, value=30)
         sort_by = st.selectbox("Sort by", SORT_OPTIONS, index=0)
-        name_filter = st.text_input("Filter by name (optional)", help="Show only attractions whose name contains this text")
+        name_filter = st.text_input("Filter by name (optional)")
         search = st.button("Search", type="primary", use_container_width=True)
         if st.button("\U0001f504 Clear cache & refresh", use_container_width=True):
             st.cache_data.clear()
@@ -388,9 +641,10 @@ def main() -> None:
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        "Prices are static estimates by category — actual ticket prices vary. "
-        "“Most famous” ranks by Wikipedia pageviews (last 30 days). "
-        "Data: [OpenStreetMap](https://openstreetmap.org) + [Wikipedia](https://wikipedia.org). "
+        "Data sources: [Wikivoyage](https://wikivoyage.org) (curated 'See/Do' lists per destination) "
+        "+ [OpenStreetMap](https://openstreetmap.org) (broader coverage) "
+        "+ [Wikipedia](https://wikipedia.org) (descriptions, popularity). "
+        "Prices come from Wikivoyage when listed; otherwise static estimates by category. "
         "No API key required."
     )
 
@@ -412,41 +666,58 @@ def main() -> None:
     st.subheader(f"\U0001f4cd {geo['display_name']}")
     st.caption(f"Coordinates: {geo['lat']:.4f}, {geo['lon']:.4f}")
 
+    with st.spinner("Fetching curated attractions from Wikivoyage…"):
+        wv_listings = fetch_wikivoyage_listings(location.strip())
+
     try:
         with st.spinner("Fetching attractions from OpenStreetMap…"):
-            elements = fetch_attractions(geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit))
+            osm_elements = fetch_attractions(
+                geo["lat"], geo["lon"], int(radius_km) * 1000, int(limit)
+            )
     except RuntimeError as e:
         st.error(str(e))
-        return
+        osm_elements = []
 
-    if not elements:
+    if not wv_listings and not osm_elements:
         st.info("No attractions found — try widening the radius or a different location.")
         return
 
-    with st.spinner(f"Ranking {len(elements)} attractions by Wikipedia popularity… (cached after first run)"):
-        enriched = [enrich(el) for el in elements]
+    with st.spinner(f"Looking up popularity and details… (cached after first run)"):
+        wv_items = [enrich_wikivoyage(l) for l in wv_listings]
+        osm_items = [enrich_osm(el) for el in osm_elements]
+
+    seen = {i["name"].lower() for i in wv_items}
+    merged = list(wv_items)
+    for item in osm_items:
+        if item["name"].lower() not in seen:
+            merged.append(item)
+            seen.add(item["name"].lower())
 
     filter_text = name_filter.strip().lower()
     if filter_text:
-        filtered = [i for i in enriched if filter_text in i["name"].lower()]
+        filtered = [i for i in merged if filter_text in i["name"].lower()]
     else:
-        filtered = enriched
+        filtered = merged
 
     sorted_items = sort_enriched(filtered, sort_by)
     if not filter_text:
         sorted_items = sorted_items[: int(limit)]
 
-    with st.expander(f"\U0001f50d Diagnostics — found {len(elements)} unique attractions in OSM"):
+    with st.expander(f"\U0001f50d Diagnostics — Wikivoyage: {len(wv_items)}, OSM: {len(osm_items)}, total merged: {len(merged)}"):
         st.write(f"Resolved location: **{geo['display_name']}** at `{geo['lat']:.5f}, {geo['lon']:.5f}`")
-        st.write(f"Radius: {radius_km} km · OSM elements (deduped by name): **{len(elements)}**")
         if filter_text:
             st.write(f"Matching filter `{name_filter}`: **{len(filtered)}**")
-        st.write("All names returned by OSM:")
-        st.write(", ".join(sorted(i["name"] for i in enriched)))
+        if wv_items:
+            st.write("Wikivoyage curated names:")
+            st.write(", ".join(sorted(i["name"] for i in wv_items)))
+        if osm_items:
+            st.write("OpenStreetMap names (excluding ones already in Wikivoyage):")
+            wv_names = {i["name"].lower() for i in wv_items}
+            st.write(", ".join(sorted(i["name"] for i in osm_items if i["name"].lower() not in wv_names)))
 
     if not sorted_items:
         if filter_text:
-            st.info(f"No attractions matched filter “{name_filter}”. Try a different spelling or clear the filter.")
+            st.info(f"No attractions matched filter “{name_filter}”.")
         else:
             st.info("No attractions to show.")
         return
