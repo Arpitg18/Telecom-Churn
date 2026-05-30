@@ -113,23 +113,27 @@ def fetch_attractions(lat: float, lon: float, radius_m: int, limit: int):
     (
       node["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
-      relation["tourism"~"^({tourism_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      relation["tourism"~"^({tourism_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
-      relation["historic"~"^({historic_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      relation["historic"~"^({historic_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["leisure"~"^({leisure_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["amenity"~"^({amenity_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
       way["natural"~"^({natural_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
-      relation["natural"~"^({natural_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      way["natural"~"^({natural_re})$"]["name"]["wikidata"](around:{radius_m},{lat},{lon});
+      relation["natural"~"^({natural_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["aerialway"~"^({aerialway_re})$"]["name"](around:{radius_m},{lat},{lon});
       node["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      node["place"~"^({place_re})$"]["name"]["wikidata"](around:{radius_m},{lat},{lon});
       way["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      way["place"~"^({place_re})$"]["name"]["wikidata"](around:{radius_m},{lat},{lon});
       relation["place"~"^({place_re})$"]["name"]["wikipedia"](around:{radius_m},{lat},{lon});
+      relation["place"~"^({place_re})$"]["name"]["wikidata"](around:{radius_m},{lat},{lon});
     );
-    out center body {limit * 8};
+    out center body {limit * 10};
     """
     resp = None
     last_status = None
@@ -199,6 +203,41 @@ def fetch_wikipedia_summary(wikipedia_tag: str):
         "extract": data.get("extract", ""),
         "thumbnail": (data.get("thumbnail") or {}).get("source"),
     }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def wikidata_to_wikipedia(qid: str):
+    if not qid or not qid.startswith("Q"):
+        return None
+    try:
+        resp = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "props": "sitelinks",
+                "format": "json",
+                "sitefilter": "enwiki",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    title = (
+        data.get("entities", {})
+        .get(qid, {})
+        .get("sitelinks", {})
+        .get("enwiki", {})
+        .get("title")
+    )
+    return f"en:{title}" if title else None
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -279,6 +318,8 @@ def _truncate(text: str, max_len: int = 280) -> str:
 def enrich(element: dict) -> dict:
     tags = element.get("tags") or {}
     wiki_tag = tags.get("wikipedia")
+    if not wiki_tag and tags.get("wikidata"):
+        wiki_tag = wikidata_to_wikipedia(tags["wikidata"])
     summary = fetch_wikipedia_summary(wiki_tag) if wiki_tag else None
     pageviews = fetch_pageviews(wiki_tag) if wiki_tag else 0
     return {
