@@ -378,9 +378,13 @@ def main() -> None:
         st.markdown("### Search")
         location = st.text_input("City / state / country", value="Lucerne")
         radius_km = st.number_input("Search radius (km)", min_value=1, max_value=100, value=30)
-        limit = st.number_input("Max results", min_value=5, max_value=50, value=20)
+        limit = st.number_input("Max results", min_value=5, max_value=100, value=30)
         sort_by = st.selectbox("Sort by", SORT_OPTIONS, index=0)
+        name_filter = st.text_input("Filter by name (optional)", help="Show only attractions whose name contains this text")
         search = st.button("Search", type="primary", use_container_width=True)
+        if st.button("\U0001f504 Clear cache & refresh", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
@@ -422,12 +426,38 @@ def main() -> None:
     with st.spinner(f"Ranking {len(elements)} attractions by Wikipedia popularity… (cached after first run)"):
         enriched = [enrich(el) for el in elements]
 
-    enriched = sort_enriched(enriched, sort_by)[: int(limit)]
+    filter_text = name_filter.strip().lower()
+    if filter_text:
+        filtered = [i for i in enriched if filter_text in i["name"].lower()]
+    else:
+        filtered = enriched
 
-    st.markdown(f"### Top {len(enriched)} activities — sorted by *{sort_by.lower()}*")
+    sorted_items = sort_enriched(filtered, sort_by)
+    if not filter_text:
+        sorted_items = sorted_items[: int(limit)]
+
+    with st.expander(f"\U0001f50d Diagnostics — found {len(elements)} unique attractions in OSM"):
+        st.write(f"Resolved location: **{geo['display_name']}** at `{geo['lat']:.5f}, {geo['lon']:.5f}`")
+        st.write(f"Radius: {radius_km} km · OSM elements (deduped by name): **{len(elements)}**")
+        if filter_text:
+            st.write(f"Matching filter `{name_filter}`: **{len(filtered)}**")
+        st.write("All names returned by OSM:")
+        st.write(", ".join(sorted(i["name"] for i in enriched)))
+
+    if not sorted_items:
+        if filter_text:
+            st.info(f"No attractions matched filter “{name_filter}”. Try a different spelling or clear the filter.")
+        else:
+            st.info("No attractions to show.")
+        return
+
+    header = f"### Top {len(sorted_items)} activities — sorted by *{sort_by.lower()}*"
+    if filter_text:
+        header += f" · filtered by “{name_filter}”"
+    st.markdown(header)
     cols_per_row = 3
-    for row_start in range(0, len(enriched), cols_per_row):
-        row = enriched[row_start : row_start + cols_per_row]
+    for row_start in range(0, len(sorted_items), cols_per_row):
+        row = sorted_items[row_start : row_start + cols_per_row]
         cols = st.columns(cols_per_row)
         for col, item in zip(cols, row):
             with col:
